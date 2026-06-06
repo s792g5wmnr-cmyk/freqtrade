@@ -377,6 +377,7 @@ def build_html(results: dict, best: str, signals: dict, timerange: str) -> str:
       {rows}
     </table>
   </td></tr>
+  {build_strategy_guide()}
   <tr><td style="padding:18px 28px 26px;background:#f8fafc;border-top:1px solid #e2e8f0;">
     <div style="font-size:11px;color:#94a3b8;line-height:1.6;">
       * Expected return &amp; max drawdown are the strategy's historical backtest figures over the window above — not a forecast.
@@ -388,6 +389,125 @@ def build_html(results: dict, best: str, signals: dict, timerange: str) -> str:
 </td></tr>
 </table>
 </body></html>"""
+
+
+# Static educational guide appended to every report. Each strategy: how it works,
+# entry/exit rules, and the math behind its indicators (monospace = email-safe).
+_GUIDE = [
+    {
+        "title": "1 · BtcEmaRsi — EMA Crossover + RSI Momentum",
+        "tf": "1h",
+        "concept": "Classic momentum. A fast EMA crossing above a slow EMA marks a shift to "
+                   "upward momentum. RSI confirms momentum is present but not exhausted; ADX "
+                   "confirms a real trend (filters out chop); the 200-EMA keeps trades aligned "
+                   "with the larger trend.",
+        "entry": "EMA(12) crosses above EMA(26) · price &gt; EMA(200) · 50 &lt; RSI &lt; 70 · ADX &gt; 20",
+        "exit": "EMA(12) crosses below EMA(26), or RSI &gt; 78 (overbought)",
+        "formulas": [
+            "EMAₜ = α·Priceₜ + (1−α)·EMAₜ₋₁ ,   α = 2 / (N + 1)",
+            "RSI = 100 − 100 / (1 + RS) ,   RS = (avg gain) / (avg loss) over 14",
+        ],
+        "diagram": "",
+    },
+    {
+        "title": "2 · BtcTrendRider — Donchian Breakout (trend-rider)",
+        "tf": "4h",
+        "concept": "Pure trend-following. Buys a fresh N-bar high (a breakout) only inside a "
+                   "confirmed uptrend, then lets the winner run with a trailing stop and exits "
+                   "when the trend weakens. The point is to capture large moves, not scalp.",
+        "entry": "close &gt; Donchian-20 high · EMA(50) &gt; EMA(200) · ADX &gt; 20",
+        "exit": "close crosses below EMA(50); trailing stop locks in gains",
+        "formulas": [
+            "Donchian upper(N) = max(High over last N bars)",
+            "Breakout: Closeₜ &gt; max(Highₜ₋₁ … Highₜ₋ₙ)",
+        ],
+        "diagram": "",
+    },
+    {
+        "title": "3 · BtcDipBuyer — RSI + Bollinger Mean-Reversion",
+        "tf": "4h",
+        "concept": "Mean reversion. When price gets stretched far below its average (a panic "
+                   "dip under the lower Bollinger Band while RSI is oversold), it tends to snap "
+                   "back. Buys the dip, takes a quick profit on the bounce.",
+        "entry": "RSI &lt; 28 · close &lt; lower Bollinger Band",
+        "exit": "RSI &gt; 55, or price reverts to the band middle / ROI",
+        "formulas": [
+            "Mid = SMA(typical price, 20) ,   typical price = (H+L+C)/3",
+            "Upper / Lower = Mid ± 2·σ   (σ = std-dev over 20 bars)",
+        ],
+        "diagram": "",
+    },
+    {
+        "title": "4 · MtfSupertrend — Multi-Timeframe Supertrend",
+        "tf": "4h + daily",
+        "concept": "An ATR-based trend line (Supertrend) that sits below price in uptrends and "
+                   "above it in downtrends; price closing across it flips the trend. The 4h "
+                   "Supertrend gives entries/exits, but they're only taken when the DAILY trend "
+                   "agrees — a higher-timeframe filter that cuts whipsaws.",
+        "entry": "4h Supertrend flips bullish  AND  daily close &gt; daily EMA(200) &amp; daily EMA(50) &gt; EMA(200)",
+        "exit": "4h Supertrend flips bearish",
+        "formulas": [
+            "TR = max(Hₜ−Lₜ , |Hₜ−Cₜ₋₁| , |Lₜ−Cₜ₋₁|) ;   ATR = average(TR, N)",
+            "Basic bands = (H+L)/2 ± multiplier·ATR  →  trend flips when close crosses the active band",
+        ],
+        "diagram": "",
+    },
+    {
+        "title": "5 · SqueezeBreakout — Bollinger/Keltner Volatility Squeeze",
+        "tf": "1h",
+        "concept": "A volatility play (TTM-squeeze). When the Bollinger Bands contract INSIDE "
+                   "the Keltner Channel, volatility is compressed — a big move usually follows. "
+                   "We wait for the squeeze to release and enter in the breakout direction.",
+        "entry": "squeeze releases (BB exits KC) · close &gt; BB mid · ROC &gt; 0 · price &gt; EMA(200)",
+        "exit": "close &lt; BB mid, or ROC &lt; 0 (momentum fades)",
+        "formulas": [
+            "Bollinger = SMA ± 2·σ      Keltner = EMA ± 1.5·ATR",
+            "SQUEEZE ON  ⇔  BB_upper &lt; KC_upper  AND  BB_lower &gt; KC_lower",
+        ],
+        "diagram": ("Keltner   |———————————————————|\n"
+                    "Bollinger      |—————————|          ← BB inside KC = SQUEEZE (coiled)\n"
+                    "release        |—————————————————|  ← BB expands out  →  trade the breakout"),
+    },
+    {
+        "title": "6 · DcaMeanReversion — Dollar-Cost-Averaging Dip Buyer",
+        "tf": "4h",
+        "concept": "Mean reversion with position scaling. Buys an oversold dip, and if price "
+                   "falls further, adds tranches to improve the average entry (DCA), then exits "
+                   "on reversion. A strict rule — only DCA when price is ABOVE the 200-EMA — "
+                   "stops it from averaging down into a falling-knife bear market.",
+        "entry": "RSI &lt; 30 · close &lt; lower BB · price &gt; EMA(200)  (uptrend-only)",
+        "exit": "RSI &gt; 58 or price reverts to BB mid; scales in (max 3 safety orders) on deeper dips",
+        "formulas": [
+            "Average entry = Σ(qtyᵢ × priceᵢ) / Σ qtyᵢ   (improves as you add lower)",
+            "Safety order i fires when profit &lt; −3.5% × (entries so far)",
+        ],
+        "diagram": "",
+    },
+]
+
+
+def build_strategy_guide() -> str:
+    cards = ""
+    fbox = ("margin:6px 0 2px;padding:8px 10px;background:#f1f5f9;border-radius:6px;"
+            "font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;"
+            "font-size:12px;color:#0f172a;white-space:pre-wrap;line-height:1.7;")
+    for g in _GUIDE:
+        formulas = "".join(f'<div style="{fbox}">{f}</div>' for f in g["formulas"])
+        diagram = (f'<div style="{fbox}background:#0f172a;color:#e2e8f0;">{g["diagram"]}</div>'
+                   if g["diagram"] else "")
+        cards += f"""
+      <div style="border:1px solid #e2e8f0;border-radius:8px;padding:14px 16px;margin-bottom:12px;">
+        <div style="font-size:14px;font-weight:700;color:#0f172a;">{g['title']}
+          <span style="font-size:11px;font-weight:500;color:#64748b;">· {g['tf']}</span></div>
+        <div style="font-size:13px;color:#475569;line-height:1.6;margin:8px 0;">{g['concept']}</div>
+        <div style="font-size:12px;color:#0f172a;margin:4px 0;"><strong style="color:#16a34a;">Entry:</strong> {g['entry']}</div>
+        <div style="font-size:12px;color:#0f172a;margin:4px 0;"><strong style="color:#dc2626;">Exit:</strong> {g['exit']}</div>
+        {formulas}{diagram}
+      </div>"""
+    return f"""<tr><td style="padding:8px 28px 16px;">
+    <div style="font-size:11px;letter-spacing:1px;color:#64748b;text-transform:uppercase;margin:14px 0 10px;">📚 Strategy reference guide — how each one works</div>
+    {cards}
+  </td></tr>"""
 
 
 def maybe_email(subject: str, html_body: str, text_body: str) -> str:
