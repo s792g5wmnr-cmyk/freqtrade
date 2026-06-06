@@ -48,7 +48,12 @@ STRATEGIES = [
     "BtcEmaRsiStrategy", "BtcTrendRiderStrategy", "BtcDipBuyerStrategy",
     "MtfSupertrendStrategy", "SqueezeBreakoutStrategy", "DcaMeanReversionStrategy",
 ]
-PAIR = "BTC/USDT"
+# Coins to report on. label = how it's shown; emoji for the section header.
+PAIRS = [
+    {"pair": "BTC/USDT", "name": "Bitcoin", "emoji": "₿"},
+    {"pair": "ETH/USDT", "name": "Ethereum", "emoji": "Ξ"},
+]
+ALL_PAIRS = [p["pair"] for p in PAIRS]
 ROLLING_DAYS = 365
 
 
@@ -58,38 +63,51 @@ def sh(cmd: list[str]) -> subprocess.CompletedProcess:
 
 
 # --- 1. Download latest data ----------------------------------------------
-def download_data(timerange: str) -> None:
-    for tf in ("1h", "4h", "1d"):
+def download_data() -> str:
+    """Download data for every pair and return the backtest timerange (the rolling
+    window). The daily (1d) timeframe gets a much longer lead-in so the daily EMA200
+    used by MtfSupertrend is fully warmed up at the start of the backtest window."""
+    end = datetime.now(timezone.utc).date()
+    leads = {"1h": ROLLING_DAYS + 30, "4h": ROLLING_DAYS + 30, "1d": ROLLING_DAYS + 260}
+    for tf, lead in leads.items():
+        start = end - timedelta(days=lead)
         sh([
             "freqtrade", "download-data", "--config", str(CONFIG),
-            "--pairs", PAIR, "--timeframe", tf, "--timerange", timerange,
+            "--pairs", *ALL_PAIRS, "--timeframe", tf,
+            "--timerange", f"{start.strftime('%Y%m%d')}-{end.strftime('%Y%m%d')}",
         ])
+    start = end - timedelta(days=ROLLING_DAYS + 30)
+    return f"{start.strftime('%Y%m%d')}-{end.strftime('%Y%m%d')}"
 
 
-# --- 2. Backtest all strategies -------------------------------------------
+# --- 2. Backtest all strategies, per pair ---------------------------------
 def run_backtests(timerange: str) -> dict:
-    """Backtest all strategies in one call and load the stats via freqtrade's API."""
-    sh([
-        "freqtrade", "backtesting", "--config", str(CONFIG),
-        "--strategy-list", *STRATEGIES,
-        "--pairs", PAIR, "--timerange", timerange,
-        "--export", "trades", "--cache", "none",
-    ])
+    """Backtest all strategies for each pair separately (so every per-coin metric
+    — return, drawdown, profit factor, Sharpe — is complete). Returns
+    {pair: {strategy: metrics}}."""
     from freqtrade.data.btanalysis import load_backtest_stats
-    stats = load_backtest_stats(str(REPO / "user_data" / "backtest_results"))
     out = {}
-    for name, s in stats.get("strategy", {}).items():
-        wins = s.get("wins")
-        total = s.get("total_trades") or 0
-        out[name] = {
-            "profit_pct": _pct(s.get("profit_total")),
-            "max_dd_pct": _pct(s.get("max_drawdown_account")),
-            "profit_factor": s.get("profit_factor"),
-            "sharpe": s.get("sharpe"),
-            "trades": total,
-            "winrate": (wins / total * 100) if (wins is not None and total) else None,
-            "market_change_pct": _pct(s.get("market_change")),
-        }
+    for pair in ALL_PAIRS:
+        sh([
+            "freqtrade", "backtesting", "--config", str(CONFIG),
+            "--strategy-list", *STRATEGIES,
+            "--pairs", pair, "--timerange", timerange,
+            "--export", "trades", "--cache", "none",
+        ])
+        stats = load_backtest_stats(str(REPO / "user_data" / "backtest_results"))
+        out[pair] = {}
+        for name, s in stats.get("strategy", {}).items():
+            wins = s.get("wins")
+            total = s.get("total_trades") or 0
+            out[pair][name] = {
+                "profit_pct": _pct(s.get("profit_total")),
+                "max_dd_pct": _pct(s.get("max_drawdown_account")),
+                "profit_factor": s.get("profit_factor"),
+                "sharpe": s.get("sharpe"),
+                "trades": total,
+                "winrate": (wins / total * 100) if (wins is not None and total) else None,
+                "market_change_pct": _pct(s.get("market_change")),
+            }
     return out
 
 
@@ -98,10 +116,26 @@ def _pct(v):
 
 
 # --- 3+4. Current signal for each strategy from the latest closed candle ---
-def load_ohlcv(tf: str) -> pd.DataFrame:
-    df = pd.read_feather(DATA_DIR / f"BTC_USDT-{tf}.feather")
+def load_ohlcv(tf: str, pair: str = "BTC/USDT") -> pd.DataFrame:
+    fname = pair.replace("/", "_")
+    df = pd.read_feather(DATA_DIR / f"{fname}-{tf}.feather")
     df["date"] = pd.to_datetime(df["date"], utc=True)
     return df.set_index("date").sort_index()
+
+
+def compute_signals(pair: str) -> dict:
+    """All six strategies' live signals for one pair."""
+    df1h = load_ohlcv("1h", pair)
+    df4h = load_ohlcv("4h", pair)
+    df1d = load_ohlcv("1d", pair)
+    return {
+        "BtcEmaRsiStrategy": signal_ema_rsi(df1h),
+        "BtcTrendRiderStrategy": signal_trend_rider(df4h),
+        "BtcDipBuyerStrategy": signal_dip_buyer(df4h),
+        "MtfSupertrendStrategy": signal_mtf_supertrend(df4h, df1d),
+        "SqueezeBreakoutStrategy": signal_squeeze(df1h),
+        "DcaMeanReversionStrategy": signal_dca(df4h),
+    }
 
 
 def crossed_below(a, b):
@@ -233,42 +267,47 @@ def pick_best(results: dict) -> str:
 
 
 # --- Report ----------------------------------------------------------------
-def build_report(results: dict, best: str, signals: dict, timerange: str) -> str:
+def build_report(results: dict, best: dict, signals: dict, timerange: str) -> str:
+    """Plain-text/markdown fallback (HTML is the primary email). Multi-coin."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    mc = next((r["market_change_pct"] for r in results.values()
-               if r["market_change_pct"] is not None), None)
     lines = [
-        f"# Daily BTC Strategy Report — {today}",
-        f"\nBacktest window: **{timerange}** (rolling {ROLLING_DAYS} days) | "
-        f"Buy & Hold over window: **{mc:+.2f}%**" if mc is not None else "",
-        "\n## Strategy comparison\n",
-        "| Strategy | Return | Max DD | Profit Factor | Sharpe | Trades | Win% |",
-        "|---|---|---|---|---|---|---|",
+        f"# Daily Crypto Strategy Report — {today}",
+        f"\nBacktest window: rolling {ROLLING_DAYS} days.",
     ]
-    for name in STRATEGIES:
-        r = results.get(name, {})
-        lines.append(
-            f"| {'**'+name+'** 🏆' if name == best else name} "
-            f"| {_f(r.get('profit_pct'),'%','+')} | {_f(r.get('max_dd_pct'),'%')} "
-            f"| {_f(r.get('profit_factor'))} | {_f(r.get('sharpe'))} "
-            f"| {r.get('trades','-')} | {_f(r.get('winrate'),'%')} |"
-        )
-    s = signals[best]
-    state = "🟢 ENTRY SIGNAL ACTIVE" if s["entry_signal"] else "⚪ No entry signal (wait / hold)"
+    for p in PAIRS:
+        pair = p["pair"]
+        pres = results.get(pair, {})
+        bname = best[pair]
+        mc = next((r["market_change_pct"] for r in pres.values()
+                   if r["market_change_pct"] is not None), None)
+        lines += [
+            f"\n## {p['name']} ({pair}) — buy & hold: "
+            f"{_f(mc, '%', '+') if mc is not None else 'n/a'}",
+            "\n| Strategy | Return | Max DD | PF | Sharpe | Trades | Win% |",
+            "|---|---|---|---|---|---|---|",
+        ]
+        for name in STRATEGIES:
+            r = pres.get(name, {})
+            tag = "**" + name + "** 🏆" if name == bname else name
+            lines.append(
+                f"| {tag} | {_f(r.get('profit_pct'),'%','+')} | {_f(r.get('max_dd_pct'),'%')} "
+                f"| {_f(r.get('profit_factor'))} | {_f(r.get('sharpe'))} "
+                f"| {r.get('trades','-')} | {_f(r.get('winrate'),'%')} |"
+            )
+        s = signals[pair][bname]
+        state = "ENTRY SIGNAL ACTIVE" if s["entry_signal"] else "No entry (hold/wait)"
+        lines += [
+            f"\nBest today: **{bname}** — {state}",
+            f"- Price: ${s['price']:,.0f} ({s['timeframe']})",
+            f"- Entry: {s['entry_trigger']}",
+            f"- Exit: {s['exit_trigger']}",
+            f"- Stop-loss: ${s['stop_level']:,.0f}",
+            f"- Expected return*: {_f(pres[bname].get('profit_pct'),'%','+')} | "
+            f"Max DD*: {_f(pres[bname].get('max_dd_pct'),'%')}",
+        ]
     lines += [
-        f"\n## Best strategy today: **{best}**\n",
-        f"- **Current signal:** {state}",
-        f"- **Timeframe:** {s['timeframe']}  |  **BTC price:** ${s['price']:,.0f}",
-        f"- **Entry point:** {s['entry_trigger']}",
-        f"- **Exit point:** {s['exit_trigger']}",
-        f"- **Stop-loss level:** ${s['stop_level']:,.0f}",
-        f"- **Expected profit (backtest return):** {_f(results[best].get('profit_pct'),'%','+')}",
-        f"- **Potential max drawdown:** {_f(results[best].get('max_dd_pct'),'%')}",
-        f"- **Indicator context:** {s['context']}",
         "\n---",
-        "_Backtest metrics are historical and not a forecast. Trend-followers profit in "
-        "trends and chop in ranges; mean-reversion is the opposite. Past performance does "
-        "not guarantee future results. Educational, not financial advice._",
+        "_*Historical backtest figures, not a forecast. Educational only — not financial advice._",
     ]
     return "\n".join(L for L in lines if L != "")
 
@@ -288,19 +327,40 @@ def _color(v):
     return "#16a34a" if v >= 0 else "#dc2626"
 
 
-def build_html(results: dict, best: str, signals: dict, timerange: str) -> str:
-    """A clean, email-client-safe HTML report (inline styles, table layout)."""
-    today = datetime.now(timezone.utc).strftime("%b %d, %Y · %H:%M UTC")
-    mc = next((r["market_change_pct"] for r in results.values()
+def _coin_section(p: dict, pres: dict, bname: str, psignals: dict) -> str:
+    """HTML block for one coin: section header + best-strategy card + ranked table."""
+    s = psignals[bname]
+    br = pres[bname]
+    mc = next((r["market_change_pct"] for r in pres.values()
                if r["market_change_pct"] is not None), None)
-    s = signals[best]
-    br = results[best]
+    cur = f"${s['price']:,.0f}"
 
-    # Comparison table rows
+    if s["entry_signal"]:
+        badge = ('<span style="background:#16a34a;color:#ffffff;padding:5px 14px;'
+                 'border-radius:999px;font-size:13px;font-weight:600;">● ENTRY SIGNAL ACTIVE</span>')
+    else:
+        badge = ('<span style="background:#e2e8f0;color:#475569;padding:5px 14px;'
+                 'border-radius:999px;font-size:13px;font-weight:600;">● No entry — hold / wait</span>')
+
+    def fact(label, value):
+        return ('<tr>'
+                f'<td style="padding:7px 0;color:#64748b;font-size:13px;width:150px;vertical-align:top;">{label}</td>'
+                f'<td style="padding:7px 0;color:#0f172a;font-size:13px;font-weight:500;">{value}</td></tr>')
+
+    facts = (
+        fact("Price", f"{cur} &nbsp;<span style='color:#94a3b8;'>({s['timeframe']} timeframe)</span>")
+        + fact("Entry point", s["entry_trigger"])
+        + fact("Exit point", s["exit_trigger"])
+        + fact("Stop-loss", f"${s['stop_level']:,.0f}")
+        + fact("Expected return*", f'<span style="color:{_color(br.get("profit_pct"))};font-weight:600;">{_f(br.get("profit_pct"), "%", "+")}</span>')
+        + fact("Max drawdown*", _f(br.get("max_dd_pct"), "%"))
+        + fact("Indicators", f"<span style='color:#475569;'>{s['context']}</span>")
+    )
+
     rows = ""
     for i, name in enumerate(STRATEGIES):
-        r = results.get(name, {})
-        is_best = name == best
+        r = pres.get(name, {})
+        is_best = name == bname
         ret = r.get("profit_pct")
         bg = "#ecfdf5" if is_best else ("#ffffff" if i % 2 == 0 else "#f8fafc")
         label = ("🏆 " if is_best else "") + name.replace("Strategy", "")
@@ -313,60 +373,28 @@ def build_html(results: dict, best: str, signals: dict, timerange: str) -> str:
             f'<td style="{cell}text-align:right;color:#334155;">{_f(r.get("max_dd_pct"), "%")}</td>'
             f'<td style="{cell}text-align:right;color:#334155;">{_f(r.get("profit_factor"))}</td>'
             f'<td style="{cell}text-align:right;color:#334155;">{r.get("trades", "–")}</td>'
-            f'<td style="{cell}text-align:right;color:#334155;">{_f(r.get("winrate"), "%")}</td>'
-            f"</tr>"
+            f'<td style="{cell}text-align:right;color:#334155;">{_f(r.get("winrate"), "%")}</td></tr>'
         )
-
-    if s["entry_signal"]:
-        badge = ('<span style="background:#16a34a;color:#ffffff;padding:5px 14px;'
-                 'border-radius:999px;font-size:13px;font-weight:600;">● ENTRY SIGNAL ACTIVE</span>')
-    else:
-        badge = ('<span style="background:#e2e8f0;color:#475569;padding:5px 14px;'
-                 'border-radius:999px;font-size:13px;font-weight:600;">● No entry — hold / wait</span>')
 
     mc_html = (f'<strong style="color:{_color(mc)};">{_f(mc, "%", "+")}</strong>'
                if mc is not None else "n/a")
 
-    def fact(label, value):
-        return (
-            '<tr>'
-            f'<td style="padding:7px 0;color:#64748b;font-size:13px;width:150px;vertical-align:top;">{label}</td>'
-            f'<td style="padding:7px 0;color:#0f172a;font-size:13px;font-weight:500;">{value}</td>'
-            '</tr>'
-        )
-
-    facts = (
-        fact("BTC price", f"${s['price']:,.0f} &nbsp;<span style='color:#94a3b8;'>({s['timeframe']} timeframe)</span>")
-        + fact("Entry point", s["entry_trigger"])
-        + fact("Exit point", s["exit_trigger"])
-        + fact("Stop-loss", f"${s['stop_level']:,.0f}")
-        + fact("Expected return*", f'<span style="color:{_color(br.get("profit_pct"))};font-weight:600;">{_f(br.get("profit_pct"), "%", "+")}</span>')
-        + fact("Max drawdown*", _f(br.get("max_dd_pct"), "%"))
-        + fact("Indicators", f"<span style='color:#475569;'>{s['context']}</span>")
-    )
-
-    return f"""<!DOCTYPE html>
-<html><body style="margin:0;padding:0;background:#eef2f6;">
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#eef2f6;padding:24px 0;">
-<tr><td align="center">
-<table role="presentation" width="640" cellpadding="0" cellspacing="0" style="max-width:640px;width:100%;background:#ffffff;border-radius:12px;overflow:hidden;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
-  <tr><td style="background:#0f172a;padding:24px 28px;">
-    <div style="color:#ffffff;font-size:20px;font-weight:700;">📈 Daily BTC Strategy Report</div>
-    <div style="color:#94a3b8;font-size:13px;margin-top:4px;">{today}</div>
+    return f"""
+  <tr><td style="padding:20px 28px 0;">
+    <div style="background:#0f172a;border-radius:8px;padding:12px 16px;">
+      <span style="color:#ffffff;font-size:17px;font-weight:700;">{p['emoji']} {p['name']}</span>
+      <span style="color:#94a3b8;font-size:12px;"> &nbsp;{p['pair']} · buy &amp; hold {mc_html}</span>
+    </div>
   </td></tr>
-  <tr><td style="padding:14px 28px;background:#f8fafc;border-bottom:1px solid #e2e8f0;color:#475569;font-size:13px;">
-    Backtest window: <strong style="color:#0f172a;">last {ROLLING_DAYS} days</strong> &nbsp;·&nbsp; BTC buy &amp; hold: {mc_html}
-  </td></tr>
-  <tr><td style="padding:24px 28px 8px;">
-    <div style="font-size:11px;letter-spacing:1px;color:#64748b;text-transform:uppercase;">Top strategy today</div>
-    <div style="font-size:22px;font-weight:700;color:#0f172a;margin:4px 0 12px;">{best.replace('Strategy', '')}</div>
-    <div style="margin-bottom:18px;">{badge}</div>
+  <tr><td style="padding:16px 28px 4px;">
+    <div style="font-size:11px;letter-spacing:1px;color:#64748b;text-transform:uppercase;">Top strategy</div>
+    <div style="font-size:20px;font-weight:700;color:#0f172a;margin:4px 0 10px;">{bname.replace('Strategy', '')}</div>
+    <div style="margin-bottom:16px;">{badge}</div>
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0">{facts}</table>
   </td></tr>
-  <tr><td style="padding:8px 28px 24px;">
-    <div style="font-size:11px;letter-spacing:1px;color:#64748b;text-transform:uppercase;margin:14px 0 8px;">All strategies, ranked</div>
+  <tr><td style="padding:8px 28px 20px;">
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:13px;border:1px solid #e2e8f0;">
-      <tr style="background:#0f172a;">
+      <tr style="background:#1e293b;">
         <th style="padding:10px 12px;text-align:left;color:#cbd5e1;font-weight:600;">Strategy</th>
         <th style="padding:10px 12px;text-align:right;color:#cbd5e1;font-weight:600;">Return</th>
         <th style="padding:10px 12px;text-align:right;color:#cbd5e1;font-weight:600;">Max&nbsp;DD</th>
@@ -376,7 +404,24 @@ def build_html(results: dict, best: str, signals: dict, timerange: str) -> str:
       </tr>
       {rows}
     </table>
+  </td></tr>"""
+
+
+def build_html(results: dict, best: dict, signals: dict, timerange: str) -> str:
+    """A clean, email-client-safe HTML report (inline styles, table layout). Multi-coin."""
+    today = datetime.now(timezone.utc).strftime("%b %d, %Y · %H:%M UTC")
+    coins = "".join(_coin_section(p, results[p["pair"]], best[p["pair"]], signals[p["pair"]])
+                    for p in PAIRS)
+    return f"""<!DOCTYPE html>
+<html><body style="margin:0;padding:0;background:#eef2f6;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#eef2f6;padding:24px 0;">
+<tr><td align="center">
+<table role="presentation" width="640" cellpadding="0" cellspacing="0" style="max-width:640px;width:100%;background:#ffffff;border-radius:12px;overflow:hidden;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
+  <tr><td style="background:#0f172a;padding:24px 28px;">
+    <div style="color:#ffffff;font-size:20px;font-weight:700;">📈 Daily Crypto Strategy Report</div>
+    <div style="color:#94a3b8;font-size:13px;margin-top:4px;">{today} &nbsp;·&nbsp; rolling {ROLLING_DAYS}-day backtest</div>
   </td></tr>
+  {coins}
   {build_strategy_guide()}
   <tr><td style="padding:18px 28px 26px;background:#f8fafc;border-top:1px solid #e2e8f0;">
     <div style="font-size:11px;color:#94a3b8;line-height:1.6;">
@@ -565,24 +610,13 @@ def maybe_email(subject: str, html_body: str, text_body: str) -> str:
 
 def main() -> int:
     end = datetime.now(timezone.utc).date()
-    start = end - timedelta(days=ROLLING_DAYS + 30)  # +30 for indicator warmup
-    timerange = f"{start.strftime('%Y%m%d')}-{end.strftime('%Y%m%d')}"
-
-    print(f"[1/4] Downloading latest data ({timerange}) ...")
-    download_data(timerange)
-    print("[2/4] Backtesting strategies ...")
+    print("[1/4] Downloading latest data ...")
+    timerange = download_data()
+    print(f"[2/4] Backtesting strategies for {len(ALL_PAIRS)} pairs ...")
     results = run_backtests(timerange)
     print("[3/4] Computing current signals ...")
-    df1h, df4h, df1d = load_ohlcv("1h"), load_ohlcv("4h"), load_ohlcv("1d")
-    signals = {
-        "BtcEmaRsiStrategy": signal_ema_rsi(df1h),
-        "BtcTrendRiderStrategy": signal_trend_rider(df4h),
-        "BtcDipBuyerStrategy": signal_dip_buyer(df4h),
-        "MtfSupertrendStrategy": signal_mtf_supertrend(df4h, df1d),
-        "SqueezeBreakoutStrategy": signal_squeeze(df1h),
-        "DcaMeanReversionStrategy": signal_dca(df4h),
-    }
-    best = pick_best(results)
+    signals = {pair: compute_signals(pair) for pair in ALL_PAIRS}
+    best = {pair: pick_best(results[pair]) for pair in ALL_PAIRS}
     report_md = build_report(results, best, signals, timerange)
     report_html = build_html(results, best, signals, timerange)
 
@@ -591,7 +625,8 @@ def main() -> int:
     html_file = REPORTS / f"{end.strftime('%Y-%m-%d')}.html"
     html_file.write_text(report_html, encoding="utf-8")
     print(f"[4/4] Report written: {out_file}")
-    subject = f"📈 BTC Strategy Report {end} — top: {best.replace('Strategy', '')}"
+    tops = " · ".join(f"{p['emoji']} {best[p['pair']].replace('Strategy', '')}" for p in PAIRS)
+    subject = f"📈 Crypto Strategy Report {end} — {tops}"
     print(maybe_email(subject, report_html, report_md))
     print("\n" + report_md)
     return 0
