@@ -244,6 +244,9 @@ def maybe_email(subject: str, body_md: str) -> str:
             headers={
                 "Authorization": f"Bearer {resend_key}",
                 "Content-Type": "application/json",
+                # A real User-Agent avoids Cloudflare bot-blocking (error 1010)
+                # that rejects the default urllib User-Agent in front of the API.
+                "User-Agent": "Mozilla/5.0 (compatible; freqtrade-report/1.0)",
             },
         )
         try:
