@@ -152,9 +152,12 @@ def signal_ema_rsi(df: pd.DataFrame) -> dict:
     price = c[-1]
     entry = (ema_f[-1] > ema_s[-1] and ema_f[-2] <= ema_s[-2]
              and price > ema_t[-1] and 50 < rsi[-1] < 70 and adx[-1] > 20)
+    exit_ = ((ema_f[-1] < ema_s[-1] and ema_f[-2] >= ema_s[-2])
+             or (rsi[-1] > 78 and rsi[-2] <= 78))
     return {
         "timeframe": "1h", "price": price,
         "entry_signal": bool(entry),
+        "exit_signal": bool(exit_),
         "entry_trigger": "EMA12 crosses > EMA26, price > EMA200, RSI 50-70, ADX>20",
         "exit_trigger": f"EMA12<EMA26 or RSI>78 (RSI now {rsi[-1]:.0f})",
         "stop_level": price * (1 - 0.10),
@@ -171,9 +174,11 @@ def signal_trend_rider(df: pd.DataFrame) -> dict:
     price = c[-1]
     entry = (price > ema_s[-1] and ema_f[-1] > ema_s[-1]
              and price > donch[-1] and adx[-1] > 20)
+    exit_ = (c[-1] < ema_f[-1] and c[-2] >= ema_f[-2])  # close crosses below EMA50
     return {
         "timeframe": "4h", "price": price,
         "entry_signal": bool(entry),
+        "exit_signal": bool(exit_),
         "entry_trigger": f"close > Donchian-20 high ({donch[-1]:.0f}) in uptrend (price>EMA200)",
         "exit_trigger": f"close crosses below EMA50 ({ema_f[-1]:.0f})",
         "stop_level": price * (1 - 0.15),
@@ -190,9 +195,11 @@ def signal_dip_buyer(df: pd.DataFrame) -> dict:
     lower = (mid - 2 * std).values
     price = c[-1]
     entry = (rsi[-1] < 28 and price < lower[-1])
+    exit_ = (rsi[-1] > 55 and rsi[-2] <= 55)  # RSI recovers through 55 (bounce done)
     return {
         "timeframe": "4h", "price": price,
         "entry_signal": bool(entry),
+        "exit_signal": bool(exit_),
         "entry_trigger": f"RSI<28 (now {rsi[-1]:.0f}) and close < lower BB ({lower[-1]:.0f})",
         "exit_trigger": "RSI>55 or +6% ROI",
         "stop_level": price * (1 - 0.08),
@@ -208,10 +215,12 @@ def signal_mtf_supertrend(df4: pd.DataFrame, df1d: pd.DataFrame) -> dict:
     daily_up = bool(df1d["close"].iloc[-1] > ema200.iloc[-1] and ema50.iloc[-1] > ema200.iloc[-1])
     bull = int(direction.iloc[-1]) == 1
     flipped = bull and int(direction.iloc[-2]) == -1
+    flipped_bear = (int(direction.iloc[-1]) == -1 and int(direction.iloc[-2]) == 1)
     st_line = float(st.iloc[-1])
     return {
         "timeframe": "4h", "price": price,
         "entry_signal": bool(flipped and daily_up),
+        "exit_signal": bool(flipped_bear),
         "entry_trigger": "4h Supertrend flips bullish while daily uptrend (close>EMA200_1d, EMA50_1d>EMA200_1d)",
         "exit_trigger": f"4h Supertrend flips bearish (line ${st_line:,.0f})",
         "stop_level": price * (1 - 0.12),
@@ -230,10 +239,17 @@ def signal_squeeze(df: pd.DataFrame) -> dict:
     entry = bool(
         released and price > bb["mid"].iloc[-1] and roc.iloc[-1] > 0 and price > ema200.iloc[-1]
     )
+    mid = bb["mid"]
+    cl = df["close"]
+    exit_ = bool(
+        (cl.iloc[-1] < mid.iloc[-1] and cl.iloc[-2] >= mid.iloc[-2])
+        or (roc.iloc[-1] < 0 and roc.iloc[-2] >= 0)
+    )
     state = "ON (compressed)" if squeeze_on.iloc[-1] else "OFF (released)"
     return {
         "timeframe": "1h", "price": price,
         "entry_signal": entry,
+        "exit_signal": exit_,
         "entry_trigger": "squeeze releases + close>BB mid + ROC>0 + price>EMA200",
         "exit_trigger": f"close < BB mid (${bb['mid'].iloc[-1]:,.0f}) or ROC<0",
         "stop_level": price * (1 - 0.06),
@@ -247,9 +263,16 @@ def signal_dca(df: pd.DataFrame) -> dict:
     ema200 = taa.EMA(df, timeperiod=200)
     price = df["close"].iloc[-1]
     entry = bool(rsi[-1] < 30 and price < bb["lower"].iloc[-1] and price > ema200.iloc[-1])
+    mid = bb["mid"]
+    cl = df["close"]
+    exit_ = bool(
+        (rsi[-1] > 58 and rsi[-2] <= 58)
+        or (cl.iloc[-1] >= mid.iloc[-1] and cl.iloc[-2] < mid.iloc[-2])
+    )
     return {
         "timeframe": "4h", "price": price,
         "entry_signal": entry,
+        "exit_signal": exit_,
         "entry_trigger": f"RSI<30 (now {rsi[-1]:.0f}) + close<BB lower (${bb['lower'].iloc[-1]:,.0f}) + price>EMA200 (uptrend-only DCA)",
         "exit_trigger": f"RSI>58 or close>=BB mid (${bb['mid'].iloc[-1]:,.0f}); scales in on further dips",
         "stop_level": price * (1 - 0.18),
