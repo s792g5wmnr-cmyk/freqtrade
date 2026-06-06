@@ -223,9 +223,39 @@ def _f(v, suffix="", sign=""):
 
 def maybe_email(subject: str, body_md: str) -> str:
     to = os.environ.get("REPORT_EMAIL_TO")
+    if not to:
+        return "email skipped (REPORT_EMAIL_TO not set)"
+    recipients = [a.strip() for a in to.split(",") if a.strip()]
+
+    # Preferred: Resend HTTPS API (port 443). Use this on hosts that block
+    # outbound SMTP ports (e.g. DigitalOcean droplets).
+    resend_key = os.environ.get("RESEND_API_KEY")
+    if resend_key:
+        import json
+        import urllib.error
+        import urllib.request
+        sender = os.environ.get("REPORT_EMAIL_FROM", "onboarding@resend.dev")
+        payload = json.dumps(
+            {"from": sender, "to": recipients, "subject": subject, "text": body_md}
+        ).encode()
+        req = urllib.request.Request(
+            "https://api.resend.com/emails",
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {resend_key}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return f"email sent via Resend to {to} (HTTP {r.status})"
+        except urllib.error.HTTPError as e:
+            return f"Resend API error {e.code}: {e.read().decode()[:300]}"
+
+    # Fallback: SMTP (works on machines that allow outbound SMTP, e.g. a Mac).
     host = os.environ.get("SMTP_HOST")
-    if not (to and host):
-        return "email skipped (REPORT_EMAIL_TO / SMTP_HOST not set)"
+    if not host:
+        return "email skipped (set RESEND_API_KEY, or SMTP_HOST for SMTP delivery)"
     msg = MIMEText(body_md, "plain", "utf-8")
     msg["Subject"] = subject
     msg["From"] = os.environ.get("SMTP_USER", "freqtrade-bot")
@@ -235,7 +265,7 @@ def maybe_email(subject: str, body_md: str) -> str:
         if os.environ.get("SMTP_USER"):
             srv.login(os.environ["SMTP_USER"], os.environ["SMTP_PASS"])
         srv.send_message(msg)
-    return f"email sent to {to}"
+    return f"email sent via SMTP to {to}"
 
 
 def main() -> int:
