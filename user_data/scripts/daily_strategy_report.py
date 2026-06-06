@@ -554,23 +554,32 @@ _GUIDE = [
 ]
 
 
+# Educational diagrams, hosted in the repo and rendered inline by email clients.
+# Regenerate with: conda run -n py310 python user_data/scripts/generate_charts.py
+_CHART_BASE = "https://raw.githubusercontent.com/s792g5wmnr-cmyk/freqtrade/develop/user_data/reports/charts"
+_CHART_FILES = ["ema_cross", "donchian", "mean_reversion", "supertrend", "squeeze", "dca"]
+
+
 def build_strategy_guide() -> str:
     cards = ""
     fbox = ("margin:6px 0 2px;padding:8px 10px;background:#f1f5f9;border-radius:6px;"
             "font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;"
             "font-size:12px;color:#0f172a;white-space:pre-wrap;line-height:1.7;")
-    for g in _GUIDE:
+    for i, g in enumerate(_GUIDE):
         formulas = "".join(f'<div style="{fbox}">{f}</div>' for f in g["formulas"])
-        diagram = (f'<div style="{fbox}background:#0f172a;color:#e2e8f0;">{g["diagram"]}</div>'
-                   if g["diagram"] else "")
+        img = (f'<img src="{_CHART_BASE}/{_CHART_FILES[i]}.png" width="100%" '
+               'style="display:block;width:100%;height:auto;border:1px solid #e2e8f0;'
+               'border-radius:6px;margin:10px 0;" '
+               f'alt="{_CHART_FILES[i]} diagram">')
         cards += f"""
-      <div style="border:1px solid #e2e8f0;border-radius:8px;padding:14px 16px;margin-bottom:12px;">
+      <div style="border:1px solid #e2e8f0;border-radius:8px;padding:14px 16px;margin-bottom:14px;">
         <div style="font-size:14px;font-weight:700;color:#0f172a;">{g['title']}
           <span style="font-size:11px;font-weight:500;color:#64748b;">· {g['tf']}</span></div>
         <div style="font-size:13px;color:#475569;line-height:1.6;margin:8px 0;">{g['concept']}</div>
+        {img}
         <div style="font-size:12px;color:#0f172a;margin:4px 0;"><strong style="color:#16a34a;">Entry:</strong> {g['entry']}</div>
         <div style="font-size:12px;color:#0f172a;margin:4px 0;"><strong style="color:#dc2626;">Exit:</strong> {g['exit']}</div>
-        {formulas}{diagram}
+        {formulas}
       </div>"""
     return f"""<tr><td style="padding:8px 28px 16px;">
     <div style="font-size:11px;letter-spacing:1px;color:#64748b;text-transform:uppercase;margin:14px 0 10px;">📚 Strategy reference guide — how each one works</div>
