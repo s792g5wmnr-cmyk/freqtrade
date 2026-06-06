@@ -23,6 +23,7 @@ import smtplib
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 
@@ -280,7 +281,116 @@ def _f(v, suffix="", sign=""):
     return f"{v:.2f}{suffix}"
 
 
-def maybe_email(subject: str, body_md: str) -> str:
+def _color(v):
+    """Green for non-negative, red for negative, grey for missing."""
+    if v is None:
+        return "#64748b"
+    return "#16a34a" if v >= 0 else "#dc2626"
+
+
+def build_html(results: dict, best: str, signals: dict, timerange: str) -> str:
+    """A clean, email-client-safe HTML report (inline styles, table layout)."""
+    today = datetime.now(timezone.utc).strftime("%b %d, %Y · %H:%M UTC")
+    mc = next((r["market_change_pct"] for r in results.values()
+               if r["market_change_pct"] is not None), None)
+    s = signals[best]
+    br = results[best]
+
+    # Comparison table rows
+    rows = ""
+    for i, name in enumerate(STRATEGIES):
+        r = results.get(name, {})
+        is_best = name == best
+        ret = r.get("profit_pct")
+        bg = "#ecfdf5" if is_best else ("#ffffff" if i % 2 == 0 else "#f8fafc")
+        label = ("🏆 " if is_best else "") + name.replace("Strategy", "")
+        weight = "700" if is_best else "400"
+        cell = "padding:10px 12px;border-bottom:1px solid #e2e8f0;"
+        rows += (
+            f'<tr style="background:{bg};">'
+            f'<td style="{cell}font-weight:{weight};color:#0f172a;">{label}</td>'
+            f'<td style="{cell}text-align:right;font-weight:600;color:{_color(ret)};">{_f(ret, "%", "+")}</td>'
+            f'<td style="{cell}text-align:right;color:#334155;">{_f(r.get("max_dd_pct"), "%")}</td>'
+            f'<td style="{cell}text-align:right;color:#334155;">{_f(r.get("profit_factor"))}</td>'
+            f'<td style="{cell}text-align:right;color:#334155;">{r.get("trades", "–")}</td>'
+            f'<td style="{cell}text-align:right;color:#334155;">{_f(r.get("winrate"), "%")}</td>'
+            f"</tr>"
+        )
+
+    if s["entry_signal"]:
+        badge = ('<span style="background:#16a34a;color:#ffffff;padding:5px 14px;'
+                 'border-radius:999px;font-size:13px;font-weight:600;">● ENTRY SIGNAL ACTIVE</span>')
+    else:
+        badge = ('<span style="background:#e2e8f0;color:#475569;padding:5px 14px;'
+                 'border-radius:999px;font-size:13px;font-weight:600;">● No entry — hold / wait</span>')
+
+    mc_html = (f'<strong style="color:{_color(mc)};">{_f(mc, "%", "+")}</strong>'
+               if mc is not None else "n/a")
+
+    def fact(label, value):
+        return (
+            '<tr>'
+            f'<td style="padding:7px 0;color:#64748b;font-size:13px;width:150px;vertical-align:top;">{label}</td>'
+            f'<td style="padding:7px 0;color:#0f172a;font-size:13px;font-weight:500;">{value}</td>'
+            '</tr>'
+        )
+
+    facts = (
+        fact("BTC price", f"${s['price']:,.0f} &nbsp;<span style='color:#94a3b8;'>({s['timeframe']} timeframe)</span>")
+        + fact("Entry point", s["entry_trigger"])
+        + fact("Exit point", s["exit_trigger"])
+        + fact("Stop-loss", f"${s['stop_level']:,.0f}")
+        + fact("Expected return*", f'<span style="color:{_color(br.get("profit_pct"))};font-weight:600;">{_f(br.get("profit_pct"), "%", "+")}</span>')
+        + fact("Max drawdown*", _f(br.get("max_dd_pct"), "%"))
+        + fact("Indicators", f"<span style='color:#475569;'>{s['context']}</span>")
+    )
+
+    return f"""<!DOCTYPE html>
+<html><body style="margin:0;padding:0;background:#eef2f6;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#eef2f6;padding:24px 0;">
+<tr><td align="center">
+<table role="presentation" width="640" cellpadding="0" cellspacing="0" style="max-width:640px;width:100%;background:#ffffff;border-radius:12px;overflow:hidden;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
+  <tr><td style="background:#0f172a;padding:24px 28px;">
+    <div style="color:#ffffff;font-size:20px;font-weight:700;">📈 Daily BTC Strategy Report</div>
+    <div style="color:#94a3b8;font-size:13px;margin-top:4px;">{today}</div>
+  </td></tr>
+  <tr><td style="padding:14px 28px;background:#f8fafc;border-bottom:1px solid #e2e8f0;color:#475569;font-size:13px;">
+    Backtest window: <strong style="color:#0f172a;">last {ROLLING_DAYS} days</strong> &nbsp;·&nbsp; BTC buy &amp; hold: {mc_html}
+  </td></tr>
+  <tr><td style="padding:24px 28px 8px;">
+    <div style="font-size:11px;letter-spacing:1px;color:#64748b;text-transform:uppercase;">Top strategy today</div>
+    <div style="font-size:22px;font-weight:700;color:#0f172a;margin:4px 0 12px;">{best.replace('Strategy', '')}</div>
+    <div style="margin-bottom:18px;">{badge}</div>
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">{facts}</table>
+  </td></tr>
+  <tr><td style="padding:8px 28px 24px;">
+    <div style="font-size:11px;letter-spacing:1px;color:#64748b;text-transform:uppercase;margin:14px 0 8px;">All strategies, ranked</div>
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:13px;border:1px solid #e2e8f0;">
+      <tr style="background:#0f172a;">
+        <th style="padding:10px 12px;text-align:left;color:#cbd5e1;font-weight:600;">Strategy</th>
+        <th style="padding:10px 12px;text-align:right;color:#cbd5e1;font-weight:600;">Return</th>
+        <th style="padding:10px 12px;text-align:right;color:#cbd5e1;font-weight:600;">Max&nbsp;DD</th>
+        <th style="padding:10px 12px;text-align:right;color:#cbd5e1;font-weight:600;">PF</th>
+        <th style="padding:10px 12px;text-align:right;color:#cbd5e1;font-weight:600;">Trades</th>
+        <th style="padding:10px 12px;text-align:right;color:#cbd5e1;font-weight:600;">Win%</th>
+      </tr>
+      {rows}
+    </table>
+  </td></tr>
+  <tr><td style="padding:18px 28px 26px;background:#f8fafc;border-top:1px solid #e2e8f0;">
+    <div style="font-size:11px;color:#94a3b8;line-height:1.6;">
+      * Expected return &amp; max drawdown are the strategy's historical backtest figures over the window above — not a forecast.
+      Trend-followers profit in trends and chop in ranges; mean-reversion is the opposite.
+      Past performance does not guarantee future results. <strong>Educational only — not financial advice.</strong>
+    </div>
+  </td></tr>
+</table>
+</td></tr>
+</table>
+</body></html>"""
+
+
+def maybe_email(subject: str, html_body: str, text_body: str) -> str:
     to = os.environ.get("REPORT_EMAIL_TO")
     if not to:
         return "email skipped (REPORT_EMAIL_TO not set)"
@@ -295,7 +405,8 @@ def maybe_email(subject: str, body_md: str) -> str:
         import urllib.request
         sender = os.environ.get("REPORT_EMAIL_FROM", "onboarding@resend.dev")
         payload = json.dumps(
-            {"from": sender, "to": recipients, "subject": subject, "text": body_md}
+            {"from": sender, "to": recipients, "subject": subject,
+             "html": html_body, "text": text_body}
         ).encode()
         req = urllib.request.Request(
             "https://api.resend.com/emails",
@@ -318,10 +429,12 @@ def maybe_email(subject: str, body_md: str) -> str:
     host = os.environ.get("SMTP_HOST")
     if not host:
         return "email skipped (set RESEND_API_KEY, or SMTP_HOST for SMTP delivery)"
-    msg = MIMEText(body_md, "plain", "utf-8")
+    msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = os.environ.get("SMTP_USER", "freqtrade-bot")
     msg["To"] = to
+    msg.attach(MIMEText(text_body, "plain", "utf-8"))
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
     with smtplib.SMTP(host, int(os.environ.get("SMTP_PORT", "587"))) as srv:
         srv.starttls()
         if os.environ.get("SMTP_USER"):
@@ -350,13 +463,17 @@ def main() -> int:
         "DcaMeanReversionStrategy": signal_dca(df4h),
     }
     best = pick_best(results)
-    report = build_report(results, best, signals, timerange)
+    report_md = build_report(results, best, signals, timerange)
+    report_html = build_html(results, best, signals, timerange)
 
     out_file = REPORTS / f"{end.strftime('%Y-%m-%d')}.md"
-    out_file.write_text(report, encoding="utf-8")
+    out_file.write_text(report_md, encoding="utf-8")
+    html_file = REPORTS / f"{end.strftime('%Y-%m-%d')}.html"
+    html_file.write_text(report_html, encoding="utf-8")
     print(f"[4/4] Report written: {out_file}")
-    print(maybe_email(f"BTC Strategy Report {end} — best: {best}", report))
-    print("\n" + report)
+    subject = f"📈 BTC Strategy Report {end} — top: {best.replace('Strategy', '')}"
+    print(maybe_email(subject, report_html, report_md))
+    print("\n" + report_md)
     return 0
 
 
