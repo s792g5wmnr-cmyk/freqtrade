@@ -22,6 +22,13 @@ apt-get update -y
 apt-get install -y python3 python3-venv python3-dev build-essential git wget curl pkg-config cron
 systemctl enable --now cron 2>/dev/null || true
 
+# Add swap on small-RAM droplets (freqtrade backtesting can spike memory).
+if ! swapon --show | grep -q .; then
+    echo "    Adding 2G swap (low-RAM safety) ..."
+    fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile >/dev/null && swapon /swapfile
+    grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+
 echo "==> [2/8] Cloning the repo to $INSTALL_DIR ..."
 if [ -d "$INSTALL_DIR/.git" ]; then
     git -C "$INSTALL_DIR" fetch --depth 1 origin "$BRANCH"
@@ -54,14 +61,16 @@ if ! python -c "import talib" 2>/dev/null; then
 fi
 python -c "import talib, freqtrade, pyarrow; print('    deps OK')"
 
-echo "==> [5/8] Auto-detecting a reachable exchange for data ..."
-START=$(date -u -d '6 days ago' +%Y%m%d); END=$(date -u +%Y%m%d)
+echo "==> [5/8] Detecting a reachable exchange and downloading ~13 months of data ..."
+START=$(date -u -d '400 days ago' +%Y%m%d); END=$(date -u +%Y%m%d)
 PICKED=""
 for EX in binanceus binance coinbase kucoin; do
     sed -i 's/"name": *"[^"]*"/"name": "'"$EX"'"/' user_data/config.json
+    # --erase guarantees a clean FULL download (freqtrade otherwise only appends
+    # forward and won't backfill earlier history, which leaves too little data).
     if freqtrade download-data --config user_data/config.json --pairs BTC/USDT \
-            --timeframe 1h --timerange "${START}-${END}" >/tmp/dl.log 2>&1; then
-        PICKED="$EX"; echo "    Using exchange: $EX"; break
+            --timeframe 1h 4h --timerange "${START}-${END}" --erase >/tmp/dl.log 2>&1; then
+        PICKED="$EX"; echo "    Using exchange: $EX (full history downloaded)"; break
     fi
 done
 if [ -z "$PICKED" ]; then
