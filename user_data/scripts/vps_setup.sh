@@ -74,11 +74,11 @@ if [ ! -f "$ENV_FILE" ]; then
     cat > "$ENV_FILE" <<'EOF'
 # Daily report email settings. Fill in SMTP_PASS with your Gmail APP PASSWORD
 # (16 chars, from https://myaccount.google.com/apppasswords). chmod 600.
-REPORT_EMAIL_TO=owen19910930@gmail.com, owen19910930@hotmail.com
-SMTP_HOST=smtp.gmail.com
-SMTP_PORT=587
-SMTP_USER=owen19910930@gmail.com
-SMTP_PASS=PUT_YOUR_GMAIL_APP_PASSWORD_HERE
+REPORT_EMAIL_TO="owen19910930@gmail.com, owen19910930@hotmail.com"
+SMTP_HOST="smtp.gmail.com"
+SMTP_PORT="587"
+SMTP_USER="owen19910930@gmail.com"
+SMTP_PASS="PUT_YOUR_GMAIL_APP_PASSWORD_HERE"
 EOF
     chmod 600 "$ENV_FILE"
     echo "    Created $ENV_FILE — you MUST edit it to set SMTP_PASS."
