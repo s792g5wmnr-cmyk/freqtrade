@@ -29,6 +29,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import talib
+import talib.abstract as taa
+from technical import qtpylib
 
 # --- Paths -----------------------------------------------------------------
 REPO = Path(__file__).resolve().parents[2]          # .../freqtrade
@@ -37,7 +39,14 @@ DATA_DIR = REPO / "user_data" / "data" / "binanceus"
 REPORTS = REPO / "user_data" / "reports"
 REPORTS.mkdir(parents=True, exist_ok=True)
 
-STRATEGIES = ["BtcEmaRsiStrategy", "BtcTrendRiderStrategy", "BtcDipBuyerStrategy"]
+# Reuse the Supertrend helper from the strategy module (DRY, identical logic).
+sys.path.insert(0, str(REPO / "user_data" / "strategies"))
+from MtfSupertrendStrategy import supertrend as _supertrend  # noqa: E402
+
+STRATEGIES = [
+    "BtcEmaRsiStrategy", "BtcTrendRiderStrategy", "BtcDipBuyerStrategy",
+    "MtfSupertrendStrategy", "SqueezeBreakoutStrategy", "DcaMeanReversionStrategy",
+]
 PAIR = "BTC/USDT"
 ROLLING_DAYS = 365
 
@@ -49,7 +58,7 @@ def sh(cmd: list[str]) -> subprocess.CompletedProcess:
 
 # --- 1. Download latest data ----------------------------------------------
 def download_data(timerange: str) -> None:
-    for tf in ("1h", "4h"):
+    for tf in ("1h", "4h", "1d"):
         sh([
             "freqtrade", "download-data", "--config", str(CONFIG),
             "--pairs", PAIR, "--timeframe", tf, "--timerange", timerange,
@@ -156,11 +165,61 @@ def signal_dip_buyer(df: pd.DataFrame) -> dict:
     }
 
 
-SIGNAL_FN = {
-    "BtcEmaRsiStrategy": signal_ema_rsi,
-    "BtcTrendRiderStrategy": signal_trend_rider,
-    "BtcDipBuyerStrategy": signal_dip_buyer,
-}
+def signal_mtf_supertrend(df4: pd.DataFrame, df1d: pd.DataFrame) -> dict:
+    st, direction = _supertrend(df4, 10, 3.0)
+    ema50 = taa.EMA(df1d, timeperiod=50)
+    ema200 = taa.EMA(df1d, timeperiod=200)
+    price = df4["close"].iloc[-1]
+    daily_up = bool(df1d["close"].iloc[-1] > ema200.iloc[-1] and ema50.iloc[-1] > ema200.iloc[-1])
+    bull = int(direction.iloc[-1]) == 1
+    flipped = bull and int(direction.iloc[-2]) == -1
+    st_line = float(st.iloc[-1])
+    return {
+        "timeframe": "4h", "price": price,
+        "entry_signal": bool(flipped and daily_up),
+        "entry_trigger": "4h Supertrend flips bullish while daily uptrend (close>EMA200_1d, EMA50_1d>EMA200_1d)",
+        "exit_trigger": f"4h Supertrend flips bearish (line ${st_line:,.0f})",
+        "stop_level": price * (1 - 0.12),
+        "context": f"4h trend={'BULL' if bull else 'BEAR'}, daily_uptrend={daily_up}, ST=${st_line:,.0f}",
+    }
+
+
+def signal_squeeze(df: pd.DataFrame) -> dict:
+    bb = qtpylib.bollinger_bands(qtpylib.typical_price(df), window=20, stds=2)
+    kc = qtpylib.keltner_channel(df, window=20, atrs=1.5)
+    squeeze_on = (bb["upper"] < kc["upper"]) & (bb["lower"] > kc["lower"])
+    roc = taa.ROC(df, timeperiod=12)
+    ema200 = taa.EMA(df, timeperiod=200)
+    price = df["close"].iloc[-1]
+    released = bool(squeeze_on.iloc[-2] and not squeeze_on.iloc[-1])
+    entry = bool(
+        released and price > bb["mid"].iloc[-1] and roc.iloc[-1] > 0 and price > ema200.iloc[-1]
+    )
+    state = "ON (compressed)" if squeeze_on.iloc[-1] else "OFF (released)"
+    return {
+        "timeframe": "1h", "price": price,
+        "entry_signal": entry,
+        "entry_trigger": "squeeze releases + close>BB mid + ROC>0 + price>EMA200",
+        "exit_trigger": f"close < BB mid (${bb['mid'].iloc[-1]:,.0f}) or ROC<0",
+        "stop_level": price * (1 - 0.06),
+        "context": f"squeeze={state}, ROC={roc.iloc[-1]:.2f}, >EMA200={price > ema200.iloc[-1]}",
+    }
+
+
+def signal_dca(df: pd.DataFrame) -> dict:
+    rsi = talib.RSI(df["close"].values, 14)
+    bb = qtpylib.bollinger_bands(qtpylib.typical_price(df), window=20, stds=2)
+    ema200 = taa.EMA(df, timeperiod=200)
+    price = df["close"].iloc[-1]
+    entry = bool(rsi[-1] < 30 and price < bb["lower"].iloc[-1] and price > ema200.iloc[-1])
+    return {
+        "timeframe": "4h", "price": price,
+        "entry_signal": entry,
+        "entry_trigger": f"RSI<30 (now {rsi[-1]:.0f}) + close<BB lower (${bb['lower'].iloc[-1]:,.0f}) + price>EMA200 (uptrend-only DCA)",
+        "exit_trigger": f"RSI>58 or close>=BB mid (${bb['mid'].iloc[-1]:,.0f}); scales in on further dips",
+        "stop_level": price * (1 - 0.18),
+        "context": f"RSI={rsi[-1]:.0f}, >EMA200={price > ema200.iloc[-1]} (no DCA in downtrends)",
+    }
 
 
 # --- Ranking ---------------------------------------------------------------
@@ -281,11 +340,14 @@ def main() -> int:
     print("[2/4] Backtesting strategies ...")
     results = run_backtests(timerange)
     print("[3/4] Computing current signals ...")
-    df1h, df4h = load_ohlcv("1h"), load_ohlcv("4h")
+    df1h, df4h, df1d = load_ohlcv("1h"), load_ohlcv("4h"), load_ohlcv("1d")
     signals = {
         "BtcEmaRsiStrategy": signal_ema_rsi(df1h),
         "BtcTrendRiderStrategy": signal_trend_rider(df4h),
         "BtcDipBuyerStrategy": signal_dip_buyer(df4h),
+        "MtfSupertrendStrategy": signal_mtf_supertrend(df4h, df1d),
+        "SqueezeBreakoutStrategy": signal_squeeze(df1h),
+        "DcaMeanReversionStrategy": signal_dca(df4h),
     }
     best = pick_best(results)
     report = build_report(results, best, signals, timerange)
