@@ -99,7 +99,8 @@ chmod +x "$INSTALL_DIR/run_report.sh"
 
 echo "==> [8/8] Installing daily cron job at ${RUN_HOUR_UTC}:00 UTC ..."
 CRON_LINE="0 ${RUN_HOUR_UTC} * * * $INSTALL_DIR/run_report.sh >> /var/log/freqtrade-report.log 2>&1"
-( crontab -l 2>/dev/null | grep -v 'run_report.sh'; echo "$CRON_LINE" ) | crontab -
+EXISTING_CRON="$(crontab -l 2>/dev/null | grep -v 'run_report.sh' || true)"
+printf '%s\n%s\n' "$EXISTING_CRON" "$CRON_LINE" | crontab -
 
 cat <<EOF
 
