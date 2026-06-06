@@ -95,7 +95,8 @@ else
     echo "    $ENV_FILE already exists; leaving it untouched."
 fi
 
-echo "==> [7/8] Writing wrapper $INSTALL_DIR/run_report.sh ..."
+echo "==> [7/8] Writing wrappers (daily report + hourly alert) ..."
+# Daily full digest
 cat > "$INSTALL_DIR/run_report.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -105,11 +106,22 @@ source "$INSTALL_DIR/.venv/bin/activate"
 exec python user_data/scripts/daily_strategy_report.py
 EOF
 chmod +x "$INSTALL_DIR/run_report.sh"
+# Hourly event-driven entry-signal alert
+cat > "$INSTALL_DIR/run_alert.sh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+set -a; source "$ENV_FILE"; set +a
+cd "$INSTALL_DIR"
+source "$INSTALL_DIR/.venv/bin/activate"
+exec python user_data/scripts/signal_alerts.py
+EOF
+chmod +x "$INSTALL_DIR/run_alert.sh"
 
-echo "==> [8/8] Installing daily cron job at ${RUN_HOUR_UTC}:00 UTC ..."
-CRON_LINE="0 ${RUN_HOUR_UTC} * * * $INSTALL_DIR/run_report.sh >> /var/log/freqtrade-report.log 2>&1"
-EXISTING_CRON="$(crontab -l 2>/dev/null | grep -v 'run_report.sh' || true)"
-printf '%s\n%s\n' "$EXISTING_CRON" "$CRON_LINE" | crontab -
+echo "==> [8/8] Installing cron jobs (daily digest + hourly alerts) ..."
+DAILY_CRON="0 ${RUN_HOUR_UTC} * * * $INSTALL_DIR/run_report.sh >> /var/log/freqtrade-report.log 2>&1"
+ALERT_CRON="0 * * * * $INSTALL_DIR/run_alert.sh >> /var/log/freqtrade-alert.log 2>&1"
+EXISTING_CRON="$(crontab -l 2>/dev/null | grep -vE 'run_report.sh|run_alert.sh' || true)"
+printf '%s\n%s\n%s\n' "$EXISTING_CRON" "$DAILY_CRON" "$ALERT_CRON" | crontab -
 
 cat <<EOF
 
